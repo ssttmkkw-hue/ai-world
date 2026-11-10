@@ -40,7 +40,10 @@ export class World extends EventEmitter {
     this.seq = store.q.maxSeq.get().s;
     this.paused = store.getMeta('paused', { paused: false, reason: '' });
     this.theme = store.getMeta('theme', null) ?? config.theme;
-    this.actsSinceSnapshot = 0;
+    // 自动快照计数从库里推算，重启不清零
+    this.lastSnapshotSeq = store.q.lastSnapSeq.get().s;
+    // 版本号：seq 或状态变化时递增，供读接口缓存
+    this.version = 0;
   }
 
   // ---------- 读取 ----------
@@ -110,7 +113,10 @@ export class World extends EventEmitter {
     if (idemKey.length > 128) throw new HttpError(400, { error: 'idempotency_key_too_long' });
 
     const reqHash = createHash('sha256').update(JSON.stringify(body ?? null)).digest('hex');
-    const prev = this.store.q.getIdem.get(agent.id, idemKey);
+    const now = this.now();
+    let prev = this.store.q.getIdem.get(agent.id, idemKey);
+    const expired = !!prev && prev.ts <= now - IDEM_TTL_MS; // 过期的 key 当作不存在
+    if (expired) prev = null;
     if (prev) {
       if (prev.req_hash !== reqHash) {
         throw new HttpError(422, { error: 'idempotency_key_reused', message: 'this Idempotency-Key was used with a different body' });
@@ -125,7 +131,7 @@ export class World extends EventEmitter {
     const v = validateAct(body, { blocklist: this.config.blocklist });
     if (v.errors) throw new HttpError(400, { error: 'invalid', details: v.errors });
 
-    this.#checkRate(agent.id, v.ops.length);
+    const used = this.#checkRate(agent.id, v.ops.length);
 
     // 可选乐观锁：if_v 与 act 开始时格子的 v 比较
     const conflicts = [];
@@ -140,7 +146,7 @@ export class World extends EventEmitter {
     }
 
     const seq = this.seq + 1;
-    const ts = this.now();
+    const ts = now;
     const working = new Map(); // idx -> cell（act 内的工作副本）
     const results = [];
     for (const op of v.ops) {
@@ -159,13 +165,24 @@ export class World extends EventEmitter {
       results.push({ op: op.op, x: op.x, y: op.y, old: before, new: after });
     }
 
-    const response = this.#commit({
+    // 响应（含 usage）在提交前就确定，和棋盘、日志一起在同一个事务里存入幂等表。
+    const response = {
+      ok: true, seq, by: agent.id, intent: v.intent, results,
+      usage: {
+        acts_last_minute: used.acts + 1,
+        ops_last_hour: used.ops + v.ops.length,
+        acts_per_minute_limit: this.config.ratePerMinute,
+        ops_per_hour_limit: this.config.opsPerHour,
+      },
+    };
+    this.#commit({
       seq, ts, by: agent.id, intent: v.intent, ops: v.ops, working,
-      extra: { results },
+      inTx: () => {
+        if (expired) this.store.q.delIdem.run(agent.id, idemKey);
+        this.store.q.putIdem.run(agent.id, idemKey, reqHash, JSON.stringify(response), ts);
+        this.store.q.pruneIdem.run(ts - IDEM_TTL_MS);
+      },
     });
-    this.store.q.putIdem.run(agent.id, idemKey, reqHash, JSON.stringify(response), ts);
-    if (seq % 50 === 0) this.store.q.pruneIdem.run(ts - IDEM_TTL_MS);
-    response.usage = this.usage(agent.id);
     return { status: 200, body: response };
   }
 
@@ -188,10 +205,14 @@ export class World extends EventEmitter {
         retry_after: retry,
       }, { 'retry-after': String(retry) });
     }
+    return { acts: minute.acts, ops: hour.ops };
   }
 
-  /** 落库（一个事务）→ 更新内存 → 广播。返回响应体。 */
-  #commit({ seq, ts, by, intent, ops, working, extra = {} }) {
+  /**
+   * 落库（一个事务：格子 + 日志 + inTx 里的幂等记录）→ 更新内存 → 广播 → 自动快照。
+   * 事务提交之后的步骤（广播、快照）失败不会把已成功的动作报告成失败。
+   */
+  #commit({ seq, ts, by, intent, ops, working, inTx }) {
     const changes = [];
     for (const [k, after] of working) {
       changes.push({ x: k % WIDTH, y: Math.floor(k / WIDTH), before: this.cells[k], after });
@@ -202,18 +223,28 @@ export class World extends EventEmitter {
         this.store.q.upsertCell.run(ch.x, ch.y, a.c, a.o, a.t, a.by, a.v);
       }
       this.store.q.insertAct.run(seq, ts, by, intent, ops.length, JSON.stringify(ops), JSON.stringify(changes));
+      if (inTx) inTx();
     });
     for (const ch of changes) this.cells[idx(ch.x, ch.y)] = ch.after;
     this.seq = seq;
+    this.version++;
 
     const cells = changes.map((ch) => ({ x: ch.x, y: ch.y, ...ch.after }));
-    this.emit('delta', { type: 'delta', seq, ts, by, name: this.auth.name(by), intent, cells });
+    this.#safely('broadcast', () => this.emit('delta', { type: 'delta', seq, ts, by, name: this.auth.name(by), intent, cells }));
 
-    this.actsSinceSnapshot++;
-    if (this.config.snapshotEveryActs > 0 && this.actsSinceSnapshot >= this.config.snapshotEveryActs) {
-      this.snapshot('auto');
+    const every = this.config.snapshotEveryActs;
+    if (every > 0 && seq - this.lastSnapshotSeq >= every) {
+      this.#safely('auto snapshot', () => this.snapshot('auto'));
     }
-    return { ok: true, seq, by, intent, ...extra };
+    return { ok: true, seq, by, intent };
+  }
+
+  #safely(what, fn) {
+    try {
+      fn();
+    } catch (err) {
+      this.emit('warn', `${what} failed after commit: ${err && err.message}`);
+    }
   }
 
   // ---------- 管理 ----------
@@ -223,6 +254,7 @@ export class World extends EventEmitter {
     if (r.error) throw new HttpError(400, { error: 'invalid', message: r.error });
     this.paused = { paused: !!paused, reason: r.value };
     this.store.setMeta('paused', this.paused);
+    this.version++;
     this.emit('status', { type: 'status', ...this.status() });
     return this.status();
   }
@@ -232,6 +264,7 @@ export class World extends EventEmitter {
     if (r.error) throw new HttpError(400, { error: 'invalid', message: r.error });
     this.theme = r.value;
     this.store.setMeta('theme', this.theme);
+    this.version++;
     this.emit('status', { type: 'status', ...this.status() });
     return this.status();
   }
@@ -239,7 +272,7 @@ export class World extends EventEmitter {
   snapshot(reason = 'manual') {
     const cells = this.sparseCells();
     const info = this.store.q.insertSnap.run(this.seq, this.now(), String(reason).slice(0, 60), JSON.stringify(cells));
-    this.actsSinceSnapshot = 0;
+    this.lastSnapshotSeq = this.seq;
     return { id: Number(info.lastInsertRowid), seq: this.seq, cells: cells.length };
   }
 

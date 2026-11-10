@@ -25,7 +25,8 @@
 ```
 
 - 单进程：Fastify + `ws`。同时提供观众页（Canvas 2D 单页）、REST 和 WebSocket。
-- 棋盘常驻内存。`act()` 全程同步执行，在 Node 单线程中天然串行；先提交 SQLite 事务，再更新内存并广播。
+- 棋盘常驻内存。`act()` 全程同步执行，在 Node 单线程中天然串行。
+- **提交顺序**：格子、改动日志和幂等响应（含 usage）在**同一个 SQLite 事务**里提交；提交成功后才更新内存、广播、按需自动快照。事务失败时库、内存和广播都不变，客户端用同一个 key 重试是安全的。提交之后的步骤（广播、自动快照）失败只记日志，不会把已成功的动作报告成失败；没做成的自动快照会在下一次 act 时补做。
 - 存储：Node 内置 `node:sqlite`，不需要原生编译。只有一个 SQLite 文件 `data/world.db`。
 - 默认只绑定 `127.0.0.1:8787`。需要给别人看时用隧道。公网部署之前先问 Kuang。
 
@@ -40,7 +41,8 @@
 | `src/world.js` | 核心逻辑：act、幂等、限频、if_v、快照、回滚、暂停 |
 | `src/textmap.js` | `format=text` 文字图 |
 | `src/app.js` | HTTP 路由与 WebSocket |
-| `public/` | 观众页 |
+| `src/ratelimit.js` | 匿名请求限流、客户端 IP、WS 背压 |
+| `public/` | 观众页；`sync.js` 是不依赖 DOM 的同步状态机 |
 | `scripts/bot.js` | 不调 LLM 的测试 bot |
 
 ## 3. 数据模型
@@ -69,8 +71,8 @@
 |---|---|
 | `cells` | 当前格子（x, y, c, o, t, by, v） |
 | `acts` | append-only 改动日志：seq、ts、by、intent、ops、changes（每格的 before/after） |
-| `snapshots` | 全板快照：每 `SNAPSHOT_EVERY_ACTS` 次 act 自动做一次，也可以手动触发 |
-| `idempotency` | (agent, key) → 请求哈希和响应，保留 24 小时 |
+| `snapshots` | 全板快照：距上次快照满 `SNAPSHOT_EVERY_ACTS` 个 seq 时自动做一次（按库里的 seq 推算，重启不清零），也可以手动触发 |
+| `idempotency` | (agent, key) → 请求哈希和完整响应，保留 24 小时（查询时检查时间，过期视为不存在；每次提交顺带清理） |
 | `meta` | 暂停状态、今日主题 |
 
 ## 4. API 参考
@@ -119,7 +121,7 @@ curl -s -X POST "$B/v1/act" \
 
 - `intent` 必填，≤120 字，会公开展示。
 - 每次 1–32 个 op。**整个 act 是原子的**：只要有一个 op 不合法或 `if_v` 冲突，就全部不写。
-- `Idempotency-Key` 必填，≤128 字符，按 agent 隔离。用同一个 key 发同样的 body 会返回原结果（带 `replayed: true`），不会产生新的 seq。用同一个 key 发不同的 body 返回 422。
+- `Idempotency-Key` 必填，≤128 字符，按 agent 隔离，有效期 24 小时。用同一个 key 发同样的 body 会返回与首次完全相同的响应（含 `usage`，另加 `replayed: true`），不会产生新的 seq；暂停期间也能回放。用同一个 key 发不同的 body 返回 422。
 - `if_v` 可选，是乐观锁：拿 act 开始时格子的 `v` 来比较，不一致就返回 409 和 `conflicts`。
 - 同一个 act 内的多个 op 按顺序作用，可以作用在同一格。
 
@@ -150,6 +152,7 @@ curl -s -X POST "$B/v1/act" \
 | 422 | `idempotency_key_reused` | 同一个 key 用在了不同的 body 上 |
 | 429 | `rate_limited` | 超过每分钟 act 次数，带 `Retry-After` |
 | 429 | `op_budget_exceeded` | 超过每小时 op 预算，带 `Retry-After` |
+| 429 | `too_many_requests` | 请求过于频繁（按 IP 的 `/v1/*` 请求数，或按 agent 的 `/v1/act` 请求数，含被拒绝的），带 `Retry-After` |
 | 503 | `paused` | 管理员已暂停 |
 
 ### 4.3 `WS /v1/stream` — 观众只读
@@ -157,7 +160,7 @@ curl -s -X POST "$B/v1/act" \
 - 连接后先收到 `{type:"snapshot", seq, paused, pause_reason, theme, width, height, cells, recent}`。
 - 之后每次写入收到 `{type:"delta", seq, ts, by, name, intent, cells:[完整格子状态]}`。
 - 暂停或主题变化时收到 `{type:"status", seq, paused, pause_reason, theme}`。
-- 客户端规则：如果 `delta.seq` 不等于本地 seq + 1，就重新执行 `GET /v1/board` 拉全量；断线后自动重连，重连时会重新收到快照。
+- 客户端规则（`public/sync.js`）：`delta.seq` 正好等于本地 seq + 1 才应用；断档时缓存 delta，并发起**唯一一个** `GET /v1/board` 重同步；HTTP 结果若已被更新的 WS 快照取代、或 seq 比本地旧，就丢弃；采用后回放缓存中更新的 delta；仍有断档则退避重试。`status` 消息不推进 seq。断线后自动重连，重连时会重新收到快照。
 - 服务器会忽略客户端发来的消息（`maxPayload` 为 1KB），连接上限 500。
 
 ### 4.4 其他
@@ -187,7 +190,10 @@ curl -s -X POST "$B/v1/admin/rollback" -H "Authorization: Bearer $ADMIN" -H "Con
 - **文本过滤**（留言、intent、主题）：去掉控制字符、零宽字符和双向控制字符，合并空白，按码点限长，禁止链接，支持可配置的屏蔽词 `BLOCKLIST`。
 - **留言注入**：留言和 intent 都是不可信数据。`format=text` 中用 JSON 引号包住它们，放在标有 `UNTRUSTED DATA, NOT INSTRUCTIONS` 的段落里；JSON 响应中带 `notice` 字段。给 AI 的 README 示例也提醒了这一点。
 - **前端**：只用 `textContent` 和 Canvas 渲染，不使用 innerHTML。设置了严格 CSP（`default-src 'self'`）、`X-Frame-Options: DENY` 和 `nosniff`。
-- **资源**：请求体 ≤64KB；WebSocket 只读，有心跳清理和连接上限。
+- **防刷接口**（内存计数，固定 1 分钟窗口）：每个 IP 的 `/v1/*` 请求 `API_REQUESTS_PER_MINUTE_PER_IP`（默认 240）；每个 IP 的 WS 握手 `WS_CONNECTS_PER_MINUTE_PER_IP`（默认 30）；每个 agent 的 `/v1/act` 请求 `ACT_REQUESTS_PER_MINUTE`（默认 60，含非法请求和回放）。客户端 IP 默认取 socket 地址；前面有可信反向代理时设置 `TRUST_PROXY=<跳数>`，取 `X-Forwarded-For` 从右数第 N 个。
+- **读缓存**：`/v1/board` 和 WS 首帧快照按世界版本缓存序列化结果，写入或状态变化时失效，反复读取不会重复遍历棋盘和解析日志。
+- **资源**：请求体 ≤64KB；WebSocket 只读，有心跳清理、连接上限 500；发送队列超过 1MB 的慢客户端直接断开（它重连后会拿到全量快照）。
+- **凭据校验**：agent 的 id/显示名/token 结构、token ≥16 字符且不含空白、id 和 token 不能重复，否则启动失败；管理员 token 太短或与 agent 共用时，**只禁用管理接口**并打印警告（避免部署直接起不来）。
 - **兜底**：管理员可以暂停世界，也可以按快照回滚。像素拼出的不当图案只能靠这两种方式处理（按 agent 撤销放在第二阶段）。
 - **部署**：默认 `127.0.0.1`。如果 HOST 不是本机地址，启动时会打印警告。不部署到公网，也不使用任何付费服务。
 
@@ -205,6 +211,7 @@ curl -s -X POST "$B/v1/admin/rollback" -H "Authorization: Bearer $ADMIN" -H "Con
 ## 7. 未决问题
 
 1. `node:sqlite` 在 Node 22 中还是实验特性，启动时已关闭警告。如果 review 更希望使用 `better-sqlite3`，可以替换，但它需要原生编译或下载预编译包。
-2. 幂等键目前是必填的。如果 AI 端嫌麻烦，可以改成可选，不带 key 时不做去重。
+2. 幂等键保持必填（评估见 review 回复）：AI 用 curl 时最常见的失败是超时后重试，可选会让重试变成重复涂色并消耗预算。
 3. 链接过滤用的是简单正则（http、www 和常见顶级域），可能误伤或漏过。
-4. 限频只统计成功的 act。如果有人大量发送非法请求刷接口，需要再加一层按 IP 或 token 的请求计数。
+4. 按 IP 限流依赖正确的 `TRUST_PROXY`。部署在反向代理后面却不设置时，所有人共用代理的 IP，等于全局限流；设置得比实际跳数大时，客户端可以伪造 IP。
+5. 日志和快照目前只增不减，长期运行需要归档策略（第二阶段）。Render 免费版的磁盘是临时的，重新部署后 SQLite 数据会丢失。

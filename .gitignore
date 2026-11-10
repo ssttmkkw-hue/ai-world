@@ -9,3 +9,9 @@ data/
 *.db-shm
 *.log
 .DS_Store
+# 自定义 DATA_DIR 时也不能误提交密钥和数据库（按文件名忽略）
+secrets.json
+**/secrets.json
+*.sqlite
+*.sqlite3
+world.db*

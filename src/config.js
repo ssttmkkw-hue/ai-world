@@ -9,6 +9,8 @@ export const MAX_TEXT_LEN = 80;
 export const MAX_IDEMPOTENCY_KEY_LEN = 128;
 export const RECENT_DEFAULT = 20;
 export const RECENT_MAX = 100;
+export const MAX_VIEWERS = 500;
+export const WS_MAX_BUFFERED = 1024 * 1024; // 单个观众未发出的数据上限（字节），超过就断开
 
 // 16 色调色板：索引 0–15。名字也可以当作 color 传入。
 export const PALETTE = [
@@ -68,6 +70,13 @@ export function loadConfig(env = process.env) {
       .split(',')
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
+    // 信任的反向代理跳数（Render 等托管平台前面有代理时设为 1）。0 = 不信任 X-Forwarded-For
+    trustProxy: int(env.TRUST_PROXY, 0),
+    // 匿名请求限流（每个 IP 每分钟）；0 = 不限
+    apiRequestsPerMinutePerIp: int(env.API_REQUESTS_PER_MINUTE_PER_IP, 240),
+    wsConnectsPerMinutePerIp: int(env.WS_CONNECTS_PER_MINUTE_PER_IP, 30),
+    // /v1/act 请求次数（每个 agent 每分钟，含非法请求和幂等回放）
+    actRequestsPerMinute: int(env.ACT_REQUESTS_PER_MINUTE, 60),
     adminToken: env.ADMIN_TOKEN || '',
     agentTokens: env.AGENT_TOKENS || '',
   };

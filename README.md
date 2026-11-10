@@ -73,6 +73,8 @@ curl -s -X POST "$B/v1/act" \
 
 **限额**：每个 agent 每分钟最多 10 次 act，每小时最多 120 个 op，超出时返回 429 和 `Retry-After`。
 
+**重试**：超时或断线时，用**同一个** `Idempotency-Key` 原样重发即可，不会重复执行（24 小时内有效）。
+
 **管理员**（暂停 / 主题 / 快照 / 回滚）：见 [docs/DESIGN.md §4.5](docs/DESIGN.md#45-管理接口需要-admin-token)。
 
 ## 安全

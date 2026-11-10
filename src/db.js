@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
   req_hash TEXT NOT NULL, response TEXT NOT NULL, ts INTEGER NOT NULL,
   PRIMARY KEY (agent, key)
 );
+CREATE INDEX IF NOT EXISTS idempotency_ts ON idempotency (ts);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 `;
 
@@ -57,7 +58,9 @@ export class Store {
       insertSnap: p('INSERT INTO snapshots (seq, ts, reason, cells) VALUES (?, ?, ?, ?)'),
       listSnaps: p('SELECT id, seq, ts, reason FROM snapshots ORDER BY id DESC LIMIT ?'),
       getSnap: p('SELECT id, seq, ts, reason, cells FROM snapshots WHERE id = ?'),
-      getIdem: p('SELECT req_hash, response FROM idempotency WHERE agent = ? AND key = ?'),
+      lastSnapSeq: p('SELECT COALESCE(MAX(seq), 0) AS s FROM snapshots'),
+      getIdem: p('SELECT req_hash, response, ts FROM idempotency WHERE agent = ? AND key = ?'),
+      delIdem: p('DELETE FROM idempotency WHERE agent = ? AND key = ?'),
       putIdem: p('INSERT INTO idempotency (agent, key, req_hash, response, ts) VALUES (?, ?, ?, ?, ?)'),
       pruneIdem: p('DELETE FROM idempotency WHERE ts < ?'),
       getMeta: p('SELECT v FROM meta WHERE k = ?'),

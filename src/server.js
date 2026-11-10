@@ -14,6 +14,7 @@ try {
 
 const config = loadConfig();
 const secrets = loadSecrets(config);
+for (const w of secrets.warnings) console.warn(`⚠️  ${w}`);
 const auth = new Auth(secrets);
 const store = new Store(join(config.dataDir, 'world.db'));
 const world = new World({ store, auth, config });

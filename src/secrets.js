@@ -12,6 +12,8 @@ export const DEFAULT_AGENTS = [
 ];
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+export const MIN_TOKEN_LEN = 16;
+const RESERVED_IDS = new Set(['admin']);
 
 export function newToken() {
   return 'aiw_' + randomBytes(24).toString('base64url');
@@ -21,7 +23,7 @@ export function parseAgentTokens(spec) {
   const agents = [];
   for (const part of spec.split(',').map((s) => s.trim()).filter(Boolean)) {
     const [id, name, token] = part.split(':');
-    if (!ID_RE.test(id || '') || !name || !token || token.length < 16) {
+    if (!ID_RE.test(id || '') || !name || !token || token.length < MIN_TOKEN_LEN) {
       throw new Error(`AGENT_TOKENS 格式错误（需要 id:显示名:token，token ≥16 字符）: ${id || part.slice(0, 8)}`);
     }
     agents.push({ id, name: name.slice(0, 32), token });
@@ -51,14 +53,48 @@ export function loadSecrets(config) {
   }
   const admin = config.adminToken || fromFile.admin;
   const agents = config.agentTokens ? parseAgentTokens(config.agentTokens) : fromFile.agents;
-  return { admin, agents, generatedPath, file };
+  const { warnings } = checkSecrets({ admin, agents }, config.agentTokens ? 'AGENT_TOKENS' : file);
+  // 管理员 token 太短或与 agent 共用时，禁用管理接口（而不是让服务起不来）
+  const adminOk = !warnings.some((w) => w.disablesAdmin);
+  return { admin: adminOk ? admin : null, agents, generatedPath, file, warnings: warnings.map((w) => w.message) };
+}
+
+/**
+ * 校验凭据。结构错误、agent token 太短、重复 id/token 直接抛错；
+ * 管理员 token 的问题只禁用管理接口并给出警告。
+ */
+export function checkSecrets({ admin, agents }, source = 'secrets') {
+  if (!Array.isArray(agents) || agents.length === 0) throw new Error(`${source}: agents 必须是非空数组`);
+  const ids = new Set();
+  const tokens = new Set();
+  for (const a of agents) {
+    if (!a || typeof a !== 'object') throw new Error(`${source}: agent 条目格式错误`);
+    if (typeof a.id !== 'string' || !ID_RE.test(a.id) || RESERVED_IDS.has(a.id)) {
+      throw new Error(`${source}: agent id 不合法: ${String(a.id).slice(0, 32)}`);
+    }
+    if (typeof a.name !== 'string' || !a.name.trim()) throw new Error(`${source}: agent ${a.id} 缺少显示名`);
+    if (typeof a.token !== 'string' || a.token.length < MIN_TOKEN_LEN || /\s/.test(a.token)) {
+      throw new Error(`${source}: agent ${a.id} 的 token 必须 ≥${MIN_TOKEN_LEN} 字符且不含空白`);
+    }
+    if (ids.has(a.id)) throw new Error(`${source}: agent id 重复: ${a.id}`);
+    if (tokens.has(a.token)) throw new Error(`${source}: 多个 agent 共用同一个 token（${a.id}）`);
+    ids.add(a.id);
+    tokens.add(a.token);
+  }
+  const warnings = [];
+  if (typeof admin !== 'string' || admin.length < MIN_TOKEN_LEN || /\s/.test(admin)) {
+    warnings.push({ disablesAdmin: true, message: `ADMIN_TOKEN 必须 ≥${MIN_TOKEN_LEN} 字符且不含空白；管理接口已禁用` });
+  } else if (tokens.has(admin)) {
+    warnings.push({ disablesAdmin: true, message: 'ADMIN_TOKEN 与某个 agent token 相同；管理接口已禁用' });
+  }
+  return { warnings };
 }
 
 const h = (t) => createHash('sha256').update(String(t)).digest();
 
 export class Auth {
   constructor({ admin, agents }) {
-    this.adminHash = h(admin);
+    this.adminHash = admin ? h(admin) : null; // null = 管理接口禁用
     this.byHash = new Map();
     this.byId = new Map();
     for (const a of agents) {
@@ -79,7 +115,7 @@ export class Auth {
 
   isAdmin(req) {
     const t = Auth.bearer(req);
-    return !!t && timingSafeEqual(h(t), this.adminHash);
+    return !!t && !!this.adminHash && timingSafeEqual(h(t), this.adminHash);
   }
 
   name(id) {

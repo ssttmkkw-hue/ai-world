@@ -1,12 +1,12 @@
-// 观众页：只读。WS 先收全量快照，再收增量；seq 断档就重新拉全量。
+// 观众页：只读。WS 先收全量快照，再收增量；seq 断档就重新拉全量（逻辑在 sync.js）。
+import { BoardSync } from './sync.js';
+
 const CELL = 16;
 const canvas = document.getElementById('board');
 const ctx = canvas.getContext('2d');
 const $ = (id) => document.getElementById(id);
 
 let meta = null;          // { width, height, palette, objects }
-let cells = new Map();    // "x,y" -> {x,y,c,o,t,by,v}
-let seq = 0;
 let recent = [];
 const flashes = new Map(); // "x,y" -> 到期时间
 let ws = null;
@@ -20,51 +20,38 @@ async function loadMeta() {
   canvas.height = meta.height * CELL;
 }
 
-function applyFull(msg) {
-  cells = new Map(msg.cells.map((c) => [key(c.x, c.y), c]));
-  seq = msg.seq;
-  recent = msg.recent || [];
-  applyStatus(msg);
-  renderRecent();
-  draw();
-}
+const sync = new BoardSync({
+  fetchBoard: async () => {
+    const r = await fetch('/v1/board?format=json');
+    if (!r.ok) throw new Error(`board ${r.status}`);
+    return r.json();
+  },
+  onUpdate(kind, p) {
+    if (kind === 'full') {
+      recent = (p.recent || []).slice();
+    } else if (kind === 'delta') {
+      const until = performance.now() + 1500;
+      for (const c of p.cells) flashes.set(key(c.x, c.y), until);
+      recent.unshift({ seq: p.seq, ts: p.ts, by: p.by, name: p.name, intent: p.intent, n_ops: p.cells.length, fresh: true });
+      recent = recent.slice(0, 50);
+    }
+    renderStatus();
+    if (kind !== 'status') {
+      renderRecent();
+      draw();
+    }
+  },
+});
 
-async function resync() {
-  const b = await (await fetch('/v1/board?format=json')).json();
-  applyFull(b);
-}
-
-function applyStatus(s) {
+function renderStatus() {
+  const s = sync.status;
   const theme = $('theme');
   theme.hidden = !s.theme;
   theme.textContent = s.theme ? `今日主题 Theme：${s.theme}` : '';
   const p = $('paused');
   p.hidden = !s.paused;
   p.textContent = s.paused ? `⏸ 世界已暂停${s.pause_reason ? '：' + s.pause_reason : ''}` : '';
-  if (typeof s.seq === 'number') setSeq(s.seq);
-}
-
-function setSeq(n) {
-  seq = n;
-  $('seq').textContent = `seq ${n}`;
-}
-
-function applyDelta(d) {
-  if (d.seq <= seq) return; // 旧消息
-  if (d.seq !== seq + 1) {
-    resync().catch(() => {}); // 断档：重新拉全量
-    return;
-  }
-  const until = performance.now() + 1500;
-  for (const c of d.cells) {
-    cells.set(key(c.x, c.y), c);
-    flashes.set(key(c.x, c.y), until);
-  }
-  setSeq(d.seq);
-  recent.unshift({ seq: d.seq, ts: d.ts, by: d.by, name: d.name, intent: d.intent, n_ops: d.cells.length, fresh: true });
-  recent = recent.slice(0, 50);
-  renderRecent();
-  draw();
+  $('seq').textContent = sync.seq >= 0 ? `seq ${sync.seq}` : 'seq –';
 }
 
 function connect() {
@@ -77,10 +64,7 @@ function connect() {
     conn.className = 'pill ok';
   };
   ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === 'snapshot') applyFull(msg);
-    else if (msg.type === 'delta') applyDelta(msg);
-    else if (msg.type === 'status') applyStatus(msg);
+    sync.handle(JSON.parse(ev.data));
   };
   ws.onclose = () => {
     conn.textContent = '重连中…';
@@ -109,7 +93,7 @@ function draw() {
   ctx.textBaseline = 'middle';
   ctx.font = `${CELL - 4}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
   const now = performance.now();
-  for (const c of cells.values()) {
+  for (const c of sync.cells.values()) {
     const px = c.x * CELL, py = c.y * CELL;
     if (c.c !== null && c.c !== undefined) {
       ctx.fillStyle = meta.palette[c.c].hex;
@@ -172,7 +156,7 @@ canvas.addEventListener('mousemove', (e) => {
   const r = canvas.getBoundingClientRect();
   const x = Math.floor(((e.clientX - r.left) / r.width) * meta.width);
   const y = Math.floor(((e.clientY - r.top) / r.height) * meta.height);
-  const c = cells.get(key(x, y));
+  const c = sync.cells.get(key(x, y));
   const parts = [`(${x}, ${y})`];
   if (c) {
     if (c.c !== null) parts.push(`颜色 ${c.c} ${meta.palette[c.c].name}`);

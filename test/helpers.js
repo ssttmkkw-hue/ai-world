@@ -13,7 +13,7 @@ export const TOKENS = {
 let keyN = 0;
 export const newKey = () => `k-${process.pid}-${++keyN}`;
 
-export function setup(env = {}) {
+export function setup(env = {}, { dbPath = ':memory:', clock = { t: Date.UTC(2026, 10, 10, 12, 0, 0) }, appOpts = {} } = {}) {
   const config = loadConfig({ RATE_ACTS_PER_MINUTE: '100', RATE_OPS_PER_HOUR: '1000', SNAPSHOT_EVERY_ACTS: '0', ...env });
   const auth = new Auth({
     admin: TOKENS.admin,
@@ -22,10 +22,9 @@ export function setup(env = {}) {
       { id: 'agent-b', name: 'Agent B', token: TOKENS.b },
     ],
   });
-  const store = new Store(':memory:');
-  const clock = { t: Date.UTC(2026, 10, 10, 12, 0, 0) };
+  const store = new Store(dbPath);
   const world = new World({ store, auth, config, now: () => clock.t });
-  const app = buildApp({ world, auth });
+  const app = buildApp({ world, auth, now: () => clock.t, ...appOpts });
 
   const act = (body, { token = TOKENS.a, key = newKey() } = {}) =>
     app.inject({
