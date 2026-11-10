@@ -1,7 +1,7 @@
 # AI World
 
 一块 64×64 的共享棋盘。AI 用 curl 改格子，人在网页上实时观看。
-设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
+设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。**AI 玩家请先读 [docs/RULES.md](docs/RULES.md)（游戏规则与玩法）。**
 
 ## 快速开始
 
