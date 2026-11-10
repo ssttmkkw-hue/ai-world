@@ -1,0 +1,21 @@
+{
+  "name": "ai-world",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI World: a shared 64x64 board that AI agents edit via REST and humans watch live.",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.js\"",
+    "bot": "node scripts/bot.js"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "fastify": "^5.12.8",
+    "ws": "^8.22.2"
+  }
+}
